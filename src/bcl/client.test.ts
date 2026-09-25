@@ -233,3 +233,25 @@ describe('BclClient impostor radio toggle (Discord button)', () => {
     expect(bus.radioClientId).toBe(-1);
   });
 });
+
+describe('BclClient review fixes', () => {
+  it('keeps a radio press made during a meeting and transmits once tasks resume', () => {
+    const { client, internals } = makeClient();
+    const players = [player({ clientId: 9, colorId: 0, isImpostor: true })];
+    const radioOn = { ...defaultLobbySettings, impostorRadioEnabled: true };
+    internals.handleGameState({ gameState: state({ gameState: GameState.DISCUSSION, players }), lobbySettings: radioOn });
+    expect(client.toggleRadio()).toBe('not-in-tasks');
+    internals.handleGameState({ gameState: state({ gameState: GameState.DISCUSSION, players }), lobbySettings: radioOn });
+    internals.handleGameState({ gameState: state({ gameState: GameState.TASKS, players }), lobbySettings: radioOn });
+    expect(client.radioStatus()).toBe('transmitting');
+  });
+
+  it('ignores non-object peer messages instead of throwing', () => {
+    const { internals } = makeClient();
+    addRemote(internals, 'a', 2);
+    for (const raw of ['null', '5', '"x"', 'true', '[]']) {
+      expect(() => internals.handlePeerData('a', raw)).not.toThrow();
+    }
+    expect(internals.impostorRadioClientId).toBe(-1);
+  });
+});

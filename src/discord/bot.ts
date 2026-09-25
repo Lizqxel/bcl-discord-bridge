@@ -278,7 +278,10 @@ export class BridgeBot {
     this.activeRounds.set(guild.id, round);
     const createdChannelIds: string[] = [];
     const localBus = new LocalAudioBus();
-    const radioChat = Boolean(guild.members.me?.permissions.has(RADIO_CHAT_PERMISSIONS));
+    // Overwrites are validated against the bot's permissions in the parent category, not server-wide.
+    let radioChat = Boolean(
+      guild.members.me?.permissionsIn(waitingChannel.parent ?? waitingChannel).has(RADIO_CHAT_PERMISSIONS),
+    );
     if (!radioChat) {
       this.options.logger.warn(
         { guildId: guild.id },
@@ -292,29 +295,39 @@ export class BridgeBot {
         const worker = availableWorkers[index]!;
         const botId = worker.client.user!.id;
         const safeName = item.member.displayName.replace(/[\r\n]/g, ' ').slice(0, 32);
-        const channel = await guild.channels.create({
-          name: `🚀 ${item.assignment.colorName}・${safeName}`,
-          type: ChannelType.GuildVoice,
-          parent: waitingChannel.parentId,
-          userLimit: 2,
-          reason: 'BCL Bridgeのゲーム開始',
-          permissionOverwrites: [
-            // Explicit types: worker bots are not in the manager's member cache.
-            { id: guild.roles.everyone.id, type: OverwriteType.Role, deny: [PermissionFlagsBits.ViewChannel] },
-            {
-              id: item.member.id,
-              type: OverwriteType.Member,
-              allow: radioChat ? [...VOICE_PERMISSIONS, PermissionFlagsBits.ReadMessageHistory] : VOICE_PERMISSIONS,
-            },
-            { id: botId, type: OverwriteType.Member, allow: VOICE_PERMISSIONS },
-            {
-              id: manager.user!.id,
-              type: OverwriteType.Member,
-              allow: radioChat ? [...MANAGER_PERMISSIONS, ...RADIO_CHAT_PERMISSIONS] : MANAGER_PERMISSIONS,
-            },
-          ],
-        });
-        createdChannelIds.push(channel.id);
+        const createChannel = (withRadio: boolean) =>
+          guild.channels.create({
+            name: `🚀 ${item.assignment.colorName}・${safeName}`,
+            type: ChannelType.GuildVoice,
+            parent: waitingChannel.parentId,
+            userLimit: 2,
+            reason: 'BCL Bridgeのゲーム開始',
+            permissionOverwrites: [
+              // Explicit types: worker bots are not in the manager's member cache.
+              { id: guild.roles.everyone.id, type: OverwriteType.Role, deny: [PermissionFlagsBits.ViewChannel] },
+              {
+                id: item.member.id,
+                type: OverwriteType.Member,
+                allow: withRadio ? [...VOICE_PERMISSIONS, PermissionFlagsBits.ReadMessageHistory] : VOICE_PERMISSIONS,
+              },
+              { id: botId, type: OverwriteType.Member, allow: VOICE_PERMISSIONS },
+              {
+                id: manager.user!.id,
+                type: OverwriteType.Member,
+                allow: withRadio ? [...MANAGER_PERMISSIONS, ...RADIO_CHAT_PERMISSIONS] : MANAGER_PERMISSIONS,
+              },
+            ],
+          });
+        let channel;
+        try {
+          channel = await createChannel(radioChat);
+        } catch (error) {
+          // 50013 Missing Permissions: a channel-level rule still blocks the radio chat overwrites.
+          if (!radioChat || (error as { code?: number }).code !== 50013) throw error;
+          this.options.logger.warn({ guildId: guild.id }, 'Radio chat overwrites refused; starting without the radio button');
+          radioChat = false;
+          channel = await createChannel(false);
+        }        createdChannelIds.push(channel.id);
         const workerGuild = await worker.client.guilds.fetch(guild.id);
         const workerChannel = await workerGuild.channels.fetch(channel.id);
         if (!workerChannel?.isVoiceBased()) throw new Error('作成した専用VCをBotが開けませんでした。');

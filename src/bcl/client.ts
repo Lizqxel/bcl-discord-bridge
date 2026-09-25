@@ -289,7 +289,10 @@ export class BclClient extends EventEmitter<ClientEvents> {
     if (previousGameState !== payload.gameState.gameState) this.updateGracePeriod(payload.gameState.gameState, previousGameState);
     this.cleanupImpostorRadio(payload.gameState);
     // A toggle, unlike BCL's held hotkey, would otherwise carry over into the next round.
-    if (payload.gameState.gameState !== GameState.TASKS) this.radioPressed = false;
+    // Clear it only when tasks end, so a press made during a meeting still takes effect.
+    if (previousGameState === GameState.TASKS && payload.gameState.gameState !== GameState.TASKS) {
+      this.radioPressed = false;
+    }
     // Follow the matched player by clientId so a color change in the lobby does not lose them.
     const tracked = this.trackedClientId === undefined
       ? undefined
@@ -424,14 +427,16 @@ export class BclClient extends EventEmitter<ClientEvents> {
 
   /** BCL VoiceController.onPeerData: impostor radio toggles and the host's lobby settings. */
   private handlePeerData(peerId: string, raw: string | Buffer): void {
-    let data: Record<string, unknown>;
+    let parsed: unknown;
     try {
-      data = JSON.parse(raw.toString()) as Record<string, unknown>;
+      parsed = JSON.parse(raw.toString());
     } catch {
       return; // Peer data is optional; ignore malformed or unrelated messages.
     }
+    if (typeof parsed !== 'object' || parsed === null) return;
+    const data = parsed as Record<string, unknown>;
     const clientId = this.clients.get(peerId)?.clientId;
-    this.stateVersion += 1;
+    const radioBefore = this.impostorRadioClientId;
     if ('impostorRadio' in data && clientId !== undefined) {
       if (this.impostorRadioClientId === -1 && data.impostorRadio) this.impostorRadioClientId = clientId;
       else if (this.impostorRadioClientId === clientId && !data.impostorRadio) this.impostorRadioClientId = -1;
@@ -439,7 +444,9 @@ export class BclClient extends EventEmitter<ClientEvents> {
     // Only the lobby host's settings count; other peers may broadcast stale ones.
     if ('maxDistance' in data && clientId !== undefined && clientId === this.state?.hostId) {
       this.lobbySettings = { ...defaultLobbySettings, ...(data as Partial<LobbySettings>) };
+      this.stateVersion += 1;
     }
+    if (this.impostorRadioClientId !== radioBefore) this.stateVersion += 1;
   }
 
   /** Whoever is on the impostor radio: a bridged player (shared in-process) or a BCL peer. */
