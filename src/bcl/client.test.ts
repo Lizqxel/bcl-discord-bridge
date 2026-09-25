@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createLogger } from '../logger.js';
 import type { VoiceParams } from '../audio/mixer.js';
 import { BclClient } from './client.js';
+import { LocalAudioBus } from './local-bus.js';
 import { CameraLocation, MapType } from './maps/AmongusMap.js';
 import { AmongUsState, defaultLobbySettings, GameState, LobbySettings, Player } from './types.js';
 
@@ -166,5 +167,69 @@ describe('BclClient mixing params', () => {
     expect(voice.left).toBeCloseTo(0.184945, 4);
     expect(voice.right).toBeCloseTo(0.78344, 4);
     expect(voice.muffle).toBe(false);
+  });
+});
+
+describe('BclClient impostor radio toggle (Discord button)', () => {
+  const radioOn = { ...defaultLobbySettings, impostorRadioEnabled: true };
+
+  function bridged(bus: LocalAudioBus, key: string, colorId: number) {
+    const client = new BclClient({
+      serverUrl: 'http://127.0.0.1:1',
+      lobbyCode: 'ABCD',
+      username: key,
+      playerColorId: colorId,
+      localBus: bus,
+      localKey: key,
+      logger: createLogger('silent'),
+    });
+    return { client, internals: client as unknown as Internals };
+  }
+
+  it('transmits only when BCL would grant it, and explains why not otherwise', () => {
+    const { client, internals } = makeClient();
+    const players = [player({ clientId: 9, colorId: 0, isImpostor: true })];
+    internals.handleGameState({ gameState: state({ gameState: GameState.TASKS, players }), lobbySettings: defaultLobbySettings });
+    expect(client.toggleRadio()).toBe('disabled');
+    client.toggleRadio(); // off again
+
+    internals.handleGameState({ gameState: state({ gameState: GameState.TASKS, players }), lobbySettings: radioOn });
+    expect(client.toggleRadio()).toBe('transmitting');
+    expect(client.toggleRadio()).toBe('off');
+  });
+
+  it('refuses crewmates', () => {
+    const { client, internals } = makeClient();
+    internals.handleGameState({
+      gameState: state({ players: [player({ clientId: 9, colorId: 0 })] }),
+      lobbySettings: radioOn,
+    });
+    expect(client.toggleRadio()).toBe('not-impostor');
+  });
+
+  it('lets another bridged impostor hear the transmission across the map, and releases it at a meeting', () => {
+    const bus = new LocalAudioBus();
+    const a = bridged(bus, 'a', 0);
+    const b = bridged(bus, 'b', 1);
+    const players = [
+      player({ clientId: 1, colorId: 0, isImpostor: true }),
+      player({ clientId: 2, colorId: 1, isImpostor: true, x: 60 }),
+    ];
+    const tasks = { gameState: state({ players }), lobbySettings: radioOn };
+    a.internals.handleGameState(tasks);
+    b.internals.handleGameState(tasks);
+
+    expect(a.client.toggleRadio()).toBe('transmitting');
+    expect(bus.radioClientId).toBe(1);
+    const heard = captureParams(b.internals).get(LocalAudioBus.sourceId('a'));
+    expect(heard?.left).toBeGreaterThan(0);
+    expect(heard?.muffle).toEqual({ type: 'highpass', frequency: 1000, q: 10 });
+
+    // B cannot grab the radio while A holds it.
+    expect(b.client.toggleRadio()).toBe('busy');
+
+    a.internals.handleGameState({ gameState: state({ gameState: GameState.DISCUSSION, players }), lobbySettings: radioOn });
+    expect(a.client.radioStatus()).toBe('off');
+    expect(bus.radioClientId).toBe(-1);
   });
 });

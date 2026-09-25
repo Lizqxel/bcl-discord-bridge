@@ -82,7 +82,7 @@ export class PcmMixer {
       }
 
       const samples = frame ? new Int16Array(frame.buffer, frame.byteOffset, frame.length / 2) : undefined;
-      if (frame && channel.reverb) channel.reverbTail = REVERB_TAIL_FRAMES;
+      if (audible && channel.reverb) channel.reverbTail = REVERB_TAIL_FRAMES;
       else if (channel.reverb) channel.reverbTail -= 1;
 
       const startLeft = channel.left;

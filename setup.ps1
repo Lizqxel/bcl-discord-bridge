@@ -58,7 +58,8 @@ if ($LASTEXITCODE -ne 0) { throw 'テストに失敗しました。' }
 npm run build
 if ($LASTEXITCODE -ne 0) { throw 'ビルドに失敗しました。' }
 
-$permissions = '19923984'
+# View Channel, Manage Channels, Send Messages, Read Message History, Connect, Speak, Move Members
+$permissions = '19991568'
 $inviteUrl = "https://discord.com/oauth2/authorize?client_id=$applicationId&permissions=$permissions&integration_type=0&scope=bot"
 
 Write-Host ''

@@ -12,7 +12,7 @@ import {
   entersState,
 } from '@discordjs/voice';
 import { VoiceBasedChannel } from 'discord.js';
-import { BclClient } from '../bcl/client.js';
+import { BclClient, RadioStatus } from '../bcl/client.js';
 import type { LocalAudioBus } from '../bcl/local-bus.js';
 import type { Logger } from '../logger.js';
 
@@ -120,6 +120,14 @@ export class BridgeSession {
       outputDrops: this.outputDrops,
       ...this.bcl.getDiagnostics(),
     };
+  }
+
+  radioStatus(): RadioStatus {
+    return this.bcl.radioStatus();
+  }
+
+  toggleRadio(): RadioStatus {
+    return this.bcl.toggleRadio();
   }
 
   setPlayerColor(colorId: number): void {

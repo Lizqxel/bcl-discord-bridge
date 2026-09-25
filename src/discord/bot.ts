@@ -1,7 +1,13 @@
 import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonInteraction,
+  ButtonStyle,
   ChannelType,
   Client,
   Events,
+  Interaction,
+  MessageFlags,
   GatewayIntentBits,
   Guild,
   GuildMember,
@@ -11,6 +17,7 @@ import {
 } from 'discord.js';
 import { appendFileSync, statSync, truncateSync } from 'node:fs';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
+import type { RadioStatus } from '../bcl/client.js';
 import { LocalAudioBus } from '../bcl/local-bus.js';
 import { BridgeSession } from './session.js';
 import type { Logger } from '../logger.js';
@@ -81,6 +88,7 @@ export type DashboardSnapshot = {
       colorName: string;
       channelId: string;
       status: string;
+      radio: RadioStatus;
     }>;
   }>;
 };
@@ -101,6 +109,19 @@ const VOICE_PERMISSIONS = [
   PermissionFlagsBits.Connect,
   PermissionFlagsBits.Speak,
 ];
+// Needed only for the radio button. Discord refuses channel overwrites that grant permissions the
+// bot lacks server-wide, so these are added only when the manager already has them.
+const RADIO_CHAT_PERMISSIONS = [PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory];
+const RADIO_BUTTON_PREFIX = 'bcl-radio:';
+
+const RADIO_REPLIES: Record<RadioStatus, string> = {
+  transmitting: '📻 無線ON：いまの声はインポスターだけに届きます。もう一度押すとOFFです。',
+  off: '🔇 無線OFF：普段の近接ボイスに戻りました。',
+  disabled: '⏳ 無線待機中：ロビー設定でインポスター無線が有効になっていません。',
+  'not-in-tasks': '⏳ 無線待機中：タスク中になると自動でONになります（会議やロビーでは使えません）。',
+  'not-impostor': '⏳ 無線待機中：生きているインポスターだけが使えます。',
+  busy: '⏳ 無線待機中：ほかのインポスターが無線を使っています。空いたら自動でONになります。',
+};
 
 export class BridgeBot {
   private readonly workers: Worker[];
@@ -120,6 +141,9 @@ export class BridgeBot {
           );
         }
       });
+      if (index === 0) {
+        client.on(Events.InteractionCreate, (interaction) => void this.handleInteraction(interaction));
+      }
       client.on(Events.Error, (error) => {
         options.logger.error({ index: index + 1, error }, 'Discord client error');
       });
@@ -170,6 +194,7 @@ export class BridgeBot {
           colorName: participant.colorName,
           channelId: participant.channelId,
           status: participant.session.getStatus(),
+          radio: participant.session.radioStatus(),
         })),
       })),
     };
@@ -253,6 +278,13 @@ export class BridgeBot {
     this.activeRounds.set(guild.id, round);
     const createdChannelIds: string[] = [];
     const localBus = new LocalAudioBus();
+    const radioChat = Boolean(guild.members.me?.permissions.has(RADIO_CHAT_PERMISSIONS));
+    if (!radioChat) {
+      this.options.logger.warn(
+        { guildId: guild.id },
+        'Manager bot lacks Send Messages / Read Message History; the impostor radio button is disabled',
+      );
+    }
 
     try {
       for (let index = 0; index < selected.length; index += 1) {
@@ -269,9 +301,17 @@ export class BridgeBot {
           permissionOverwrites: [
             // Explicit types: worker bots are not in the manager's member cache.
             { id: guild.roles.everyone.id, type: OverwriteType.Role, deny: [PermissionFlagsBits.ViewChannel] },
-            { id: item.member.id, type: OverwriteType.Member, allow: VOICE_PERMISSIONS },
+            {
+              id: item.member.id,
+              type: OverwriteType.Member,
+              allow: radioChat ? [...VOICE_PERMISSIONS, PermissionFlagsBits.ReadMessageHistory] : VOICE_PERMISSIONS,
+            },
             { id: botId, type: OverwriteType.Member, allow: VOICE_PERMISSIONS },
-            { id: manager.user!.id, type: OverwriteType.Member, allow: MANAGER_PERMISSIONS },
+            {
+              id: manager.user!.id,
+              type: OverwriteType.Member,
+              allow: radioChat ? [...MANAGER_PERMISSIONS, ...RADIO_CHAT_PERMISSIONS] : MANAGER_PERMISSIONS,
+            },
           ],
         });
         createdChannelIds.push(channel.id);
@@ -299,6 +339,7 @@ export class BridgeBot {
           channelId: channel.id,
           session,
         });
+        if (radioChat) await this.postRadioButton(channel, item.member.id);
         await item.member.voice.setChannel(channel, 'BCL Bridgeのゲーム開始');
       }
       this.options.logger.info(
@@ -332,6 +373,47 @@ export class BridgeBot {
     const channel = this.manager?.guilds.cache.get(guildId)?.channels.cache.get(participant.channelId);
     const safeName = participant.displayName.replace(/[\r\n]/g, ' ').slice(0, 32);
     void channel?.setName(`🚀 ${colorName}・${safeName}`).catch(() => undefined);
+  }
+
+  /** Posts the impostor radio toggle in the private VC's text chat (phones cannot press a hotkey). */
+  private async postRadioButton(channel: VoiceBasedChannel, userId: string): Promise<void> {
+    try {
+      const button = new ButtonBuilder()
+        .setCustomId(RADIO_BUTTON_PREFIX + userId)
+        .setLabel('📻 インポスター無線 ON / OFF')
+        .setStyle(ButtonStyle.Danger);
+      await channel.send({
+        content:
+          'インポスターのときは、このボタンで**インポスター無線**をON/OFFできます（BetterCrewLinkのロビー設定で無線が有効な場合のみ）。\n' +
+          '会議やロビーに入ると自動でOFFになります。',
+        components: [new ActionRowBuilder<ButtonBuilder>().addComponents(button)],
+      });
+    } catch (error) {
+      // The radio is optional; never fail a round because the chat message could not be posted.
+      this.options.logger.warn({ error, channelId: channel.id }, 'Could not post the radio button');
+    }
+  }
+
+  private async handleInteraction(interaction: Interaction): Promise<void> {
+    if (!interaction.isButton() || !interaction.customId.startsWith(RADIO_BUTTON_PREFIX)) return;
+    try {
+      await this.handleRadioButton(interaction);
+    } catch (error) {
+      this.options.logger.warn({ error }, 'Radio button failed');
+    }
+  }
+
+  private async handleRadioButton(interaction: ButtonInteraction): Promise<void> {
+    const userId = interaction.customId.slice(RADIO_BUTTON_PREFIX.length);
+    const participant = interaction.guildId
+      ? this.activeRounds.get(interaction.guildId)?.participants.find((item) => item.userId === userId)
+      : undefined;
+    const reply = (content: string) => interaction.reply({ content, flags: MessageFlags.Ephemeral });
+    if (!participant) return void (await reply('このゲームはもう終了しています。'));
+    if (interaction.user.id !== userId) {
+      return void (await reply(`これは ${participant.displayName} さん用のボタンです。`));
+    }
+    await reply(RADIO_REPLIES[participant.session.toggleRadio()]);
   }
 
   async stopRound(guildId: string): Promise<void> {

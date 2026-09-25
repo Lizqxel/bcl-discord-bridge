@@ -31,6 +31,8 @@ import {
 
 const LOBBY_FALLBACK_GAIN = Math.SQRT1_2;
 
+export type RadioStatus = 'off' | 'transmitting' | 'disabled' | 'not-in-tasks' | 'not-impostor' | 'busy';
+
 type ClientEvents = {
   status: [status: string];
   mixedOpus: [packet: Buffer];
@@ -77,6 +79,9 @@ export class BclClient extends EventEmitter<ClientEvents> {
   /** clientId of the impostor currently talking on the radio (-1 = nobody), as in BCL. */
   private impostorRadioClientId = -1;
   private gracePeriodEndsAt = 0;
+  /** The phone player's radio toggle (Discord button) and whether BCL's rules grant it. */
+  private radioPressed = false;
+  private radioTransmitting = false;
   /** Bumped whenever the inputs to the voice rules change, so params are rebuilt only then. */
   private stateVersion = 0;
   private cachedParams = new Map<string, VoiceParams>();
@@ -218,6 +223,7 @@ export class BclClient extends EventEmitter<ClientEvents> {
     await this.destroyPeers();
     for (const remote of this.remoteAudio.values()) remote.decoder.close();
     this.remoteAudio.clear();
+    this.localBus?.setRadioTransmitter(this.localKey, undefined);
     this.localBus?.unregister(this.localKey);
     this.outputEncoder.close();
     this.micDecoder.close();
@@ -282,6 +288,8 @@ export class BclClient extends EventEmitter<ClientEvents> {
     if (payload.lobbySettings) this.lobbySettings = { ...defaultLobbySettings, ...payload.lobbySettings };
     if (previousGameState !== payload.gameState.gameState) this.updateGracePeriod(payload.gameState.gameState, previousGameState);
     this.cleanupImpostorRadio(payload.gameState);
+    // A toggle, unlike BCL's held hotkey, would otherwise carry over into the next round.
+    if (payload.gameState.gameState !== GameState.TASKS) this.radioPressed = false;
     // Follow the matched player by clientId so a color change in the lobby does not lose them.
     const tracked = this.trackedClientId === undefined
       ? undefined
@@ -294,6 +302,7 @@ export class BclClient extends EventEmitter<ClientEvents> {
         ));
     if (!player) {
       this.localPlayer = undefined;
+      this.applyImpostorRadio(); // a vanished transmitter must release the radio
       this.emit('status', this.colorId === undefined ? 'waiting-for-player-name' : 'waiting-for-player-color');
       return;
     }
@@ -301,6 +310,7 @@ export class BclClient extends EventEmitter<ClientEvents> {
     this.localPlayer = player;
     this.trackedClientId = player.clientId;
     this.localBus?.setClientId(this.localKey, player.clientId);
+    this.applyImpostorRadio();
     if (!this.joinedGameRoom) this.joinGameRoom(player);
     else {
       // Tell BCL Desktop which player this voice now belongs to (e.g. after a color fix).
@@ -432,6 +442,50 @@ export class BclClient extends EventEmitter<ClientEvents> {
     }
   }
 
+  /** Whoever is on the impostor radio: a bridged player (shared in-process) or a BCL peer. */
+  private get effectiveRadioClientId(): number {
+    const local = this.localBus?.radioClientId ?? -1;
+    return local !== -1 ? local : this.impostorRadioClientId;
+  }
+
+  /** Toggles this player's impostor radio (the Discord button). Returns the resulting state. */
+  toggleRadio(): RadioStatus {
+    this.radioPressed = !this.radioPressed;
+    this.applyImpostorRadio();
+    return this.radioStatus();
+  }
+
+  radioStatus(): RadioStatus {
+    if (this.radioTransmitting) return 'transmitting';
+    if (!this.radioPressed) return 'off';
+    const me = this.localPlayer;
+    if (!this.lobbySettings.impostorRadioEnabled) return 'disabled';
+    if (this.state?.gameState !== GameState.TASKS) return 'not-in-tasks';
+    if (!me?.isImpostor || me.isDead) return 'not-impostor';
+    return 'busy';
+  }
+
+  /** BCL VoiceController.applyImpostorRadio, with the Discord toggle standing in for the hotkey. */
+  private applyImpostorRadio(): void {
+    const me = this.localPlayer;
+    const current = this.effectiveRadioClientId;
+    const granted =
+      this.radioPressed &&
+      this.state?.gameState === GameState.TASKS &&
+      me !== undefined &&
+      me.isImpostor &&
+      !me.isDead &&
+      (current === -1 || current === me.clientId) &&
+      this.lobbySettings.impostorRadioEnabled;
+    if (granted === this.radioTransmitting) return;
+    this.radioTransmitting = granted;
+    this.localBus?.setRadioTransmitter(this.localKey, granted && me ? me.clientId : undefined);
+    this.stateVersion += 1;
+    const message = JSON.stringify({ impostorRadio: granted });
+    for (const peer of this.peers.values()) peer.sendData(message);
+    this.options.logger.info({ username: this.options.username, granted }, 'Impostor radio changed');
+  }
+
   /** BCL VoiceController.updateGracePeriod: keep voices on briefly after a meeting (meetingGhostOnly). */
   private updateGracePeriod(current: GameState, previous: GameState | undefined): void {
     if (current === GameState.LOBBY || current === GameState.MENU || current === GameState.UNKNOWN) {
@@ -499,7 +553,8 @@ export class BclClient extends EventEmitter<ClientEvents> {
       clients: Object.fromEntries(this.clients),
       localSpeakers: this.localBus?.speakersFor(this.localKey) ?? [],
       lastGains: Object.fromEntries(this.lastGains),
-      impostorRadioClientId: this.impostorRadioClientId,
+      impostorRadioClientId: this.effectiveRadioClientId,
+      radio: this.radioStatus(),
       inGracePeriod: this.gracePeriodEndsAt > Date.now(),
       lobbySettings: this.lobbySettings,
       queues: this.mixer.stats(),
@@ -537,7 +592,7 @@ export class BclClient extends EventEmitter<ClientEvents> {
         me: listener,
         other: speaker,
         maxDistance,
-        impostorRadioClientId: this.impostorRadioClientId,
+        impostorRadioClientId: this.effectiveRadioClientId,
         inGracePeriod,
       });
       const gain = applyListenerVolume(result.gain, settings, listener, speaker);
@@ -550,7 +605,7 @@ export class BclClient extends EventEmitter<ClientEvents> {
     const locals = this.localBus?.speakersFor(this.localKey, true) ?? [];
     const key = [
       this.stateVersion,
-      this.impostorRadioClientId,
+      this.effectiveRadioClientId,
       inGracePeriod,
       listener?.clientId,
       remotes.map(([peerId, identity]) => `${peerId}:${identity.clientId}`).join(','),
