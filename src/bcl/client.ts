@@ -4,14 +4,22 @@ import { io, Socket } from 'socket.io-client';
 import { MediaStreamTrack, RtpHeader, RtpPacket } from 'werift';
 import { FRAME_DURATION_MS, SAMPLES_PER_CHANNEL } from '../audio/constants.js';
 import { PcmFrameQueue } from '../audio/frame-queue.js';
-import { PcmMixer, StereoGain } from '../audio/mixer.js';
+import { PcmMixer, VoiceParams } from '../audio/mixer.js';
+import { pannerGains } from '../audio/panner.js';
 import { OpusCodec } from '../audio/opus.js';
 import type { Logger } from '../logger.js';
 import { LocalAudioBus } from './local-bus.js';
 import { BclPeer, SignalData } from './peer.js';
-import { calculateSpatialMix, findPlayerByColor, findPlayerByName } from './proximity.js';
+import { findPlayerByColor, findPlayerByName } from './proximity.js';
+import {
+  applyListenerVolume,
+  calculateVoiceAudio,
+  defaultListenerAudioSettings,
+  listenerMaxDistance,
+} from './voice-audio.js';
 import {
   AmongUsState,
+  CameraLocation,
   GameState,
   ClientIdentity,
   ClientPeerConfig,
@@ -66,6 +74,13 @@ export class BclClient extends EventEmitter<ClientEvents> {
   private watchdogTimer?: NodeJS.Timeout;
   private lastGains = new Map<string, number>();
   private trackedClientId?: number;
+  /** clientId of the impostor currently talking on the radio (-1 = nobody), as in BCL. */
+  private impostorRadioClientId = -1;
+  private gracePeriodEndsAt = 0;
+  /** Bumped whenever the inputs to the voice rules change, so params are rebuilt only then. */
+  private stateVersion = 0;
+  private cachedParams = new Map<string, VoiceParams>();
+  private cachedParamsKey = '';
   private announcedClientId?: number;
   private colorId?: number;
   private mixStats = { catchUpFrames: 0, resyncs: 0, maxTickGapMs: 0 };
@@ -260,8 +275,13 @@ export class BclClient extends EventEmitter<ClientEvents> {
         'BCL game state changed',
       );
     }
+    this.stateVersion += 1;
+    const previousGameState = this.state?.gameState;
     this.state = payload.gameState;
-    this.lobbySettings = { ...this.lobbySettings, ...payload.lobbySettings };
+    // The mobile feed carries BCL Desktop's active (host) lobby settings.
+    if (payload.lobbySettings) this.lobbySettings = { ...defaultLobbySettings, ...payload.lobbySettings };
+    if (previousGameState !== payload.gameState.gameState) this.updateGracePeriod(payload.gameState.gameState, previousGameState);
+    this.cleanupImpostorRadio(payload.gameState);
     // Follow the matched player by clientId so a color change in the lobby does not lose them.
     const tracked = this.trackedClientId === undefined
       ? undefined
@@ -369,7 +389,7 @@ export class BclClient extends EventEmitter<ClientEvents> {
       logger: this.options.logger,
       onSignal: (data) => this.voiceSocket?.emit('signal', { to: id, data }),
       onRemoteTrack: (track) => this.attachRemoteTrack(id, track),
-      onData: (data) => this.handlePeerData(data),
+      onData: (data) => this.handlePeerData(id, data),
       onClosed: () => {
         if (this.peers.get(id) === peer) this.removePeer(id);
       },
@@ -392,13 +412,56 @@ export class BclClient extends EventEmitter<ClientEvents> {
     });
   }
 
-  private handlePeerData(raw: string | Buffer): void {
+  /** BCL VoiceController.onPeerData: impostor radio toggles and the host's lobby settings. */
+  private handlePeerData(peerId: string, raw: string | Buffer): void {
+    let data: Record<string, unknown>;
     try {
-      const data = JSON.parse(raw.toString()) as Partial<LobbySettings>;
-      this.lobbySettings = { ...this.lobbySettings, ...data };
+      data = JSON.parse(raw.toString()) as Record<string, unknown>;
     } catch {
-      // Peer data is optional; ignore malformed or unrelated messages.
+      return; // Peer data is optional; ignore malformed or unrelated messages.
     }
+    const clientId = this.clients.get(peerId)?.clientId;
+    this.stateVersion += 1;
+    if ('impostorRadio' in data && clientId !== undefined) {
+      if (this.impostorRadioClientId === -1 && data.impostorRadio) this.impostorRadioClientId = clientId;
+      else if (this.impostorRadioClientId === clientId && !data.impostorRadio) this.impostorRadioClientId = -1;
+    }
+    // Only the lobby host's settings count; other peers may broadcast stale ones.
+    if ('maxDistance' in data && clientId !== undefined && clientId === this.state?.hostId) {
+      this.lobbySettings = { ...defaultLobbySettings, ...(data as Partial<LobbySettings>) };
+    }
+  }
+
+  /** BCL VoiceController.updateGracePeriod: keep voices on briefly after a meeting (meetingGhostOnly). */
+  private updateGracePeriod(current: GameState, previous: GameState | undefined): void {
+    if (current === GameState.LOBBY || current === GameState.MENU || current === GameState.UNKNOWN) {
+      this.gracePeriodEndsAt = 0;
+      return;
+    }
+    if (current !== GameState.TASKS) return;
+    if (previous !== GameState.LOBBY && previous !== GameState.DISCUSSION) return;
+    const gracePeriod = Math.min(Math.max(Number(this.lobbySettings.gracePeriod) || 0, 0), 10);
+    if (!this.lobbySettings.meetingGhostOnly || gracePeriod <= 0) return;
+    this.gracePeriodEndsAt = Date.now() + gracePeriod * 1000;
+  }
+
+  /** BCL VoiceController.cleanupImpostorRadio: drop a transmitter that can no longer be on the radio. */
+  private cleanupImpostorRadio(state: AmongUsState): void {
+    if (this.impostorRadioClientId === -1) return;
+    const stillActive =
+      state.gameState === GameState.TASKS &&
+      [...this.clients.entries()].some(
+        ([peerId, identity]) => identity.clientId === this.impostorRadioClientId && this.remoteAudio.has(peerId),
+      ) &&
+      state.players.some(
+        (player) =>
+          player.clientId === this.impostorRadioClientId &&
+          player.isImpostor &&
+          !player.isDead &&
+          !player.disconnected &&
+          !player.bugged,
+      );
+    if (!stillActive) this.impostorRadioClientId = -1;
   }
 
   private takeMixStats(): Record<string, number> {
@@ -436,6 +499,9 @@ export class BclClient extends EventEmitter<ClientEvents> {
       clients: Object.fromEntries(this.clients),
       localSpeakers: this.localBus?.speakersFor(this.localKey) ?? [],
       lastGains: Object.fromEntries(this.lastGains),
+      impostorRadioClientId: this.impostorRadioClientId,
+      inGracePeriod: this.gracePeriodEndsAt > Date.now(),
+      lobbySettings: this.lobbySettings,
       queues: this.mixer.stats(),
       mix: this.takeMixStats(),
     };
@@ -449,34 +515,70 @@ export class BclClient extends EventEmitter<ClientEvents> {
     // Everyone is standing together there, so play unplaced voices flat instead of muting.
     const inLobby = state.gameState === GameState.LOBBY;
     if (!listener && !inLobby) return;
-    const gainFor = (clientId: number | undefined): StereoGain | undefined => {
+
+    // state.currentCamera is the host's own camera view; a bridged phone player is never on cams.
+    const listenerState: AmongUsState = { ...state, currentCamera: CameraLocation.NONE };
+    const maxDistance = listener ? listenerMaxDistance(state, this.lobbySettings, listener) : this.lobbySettings.maxDistance;
+    const inGracePeriod = this.gracePeriodEndsAt > Date.now();
+    const settings = defaultListenerAudioSettings;
+
+    const paramsFor = (clientId: number | undefined): VoiceParams | undefined => {
       const speaker = clientId === undefined
         ? undefined
         : state.players.find((candidate) => candidate.clientId === clientId);
-      if (listener && speaker) {
-        const mix = calculateSpatialMix(state, this.lobbySettings, listener, speaker);
-        return { left: mix.leftGain, right: mix.rightGain };
+      if (!listener || !speaker) {
+        return inLobby ? { left: LOBBY_FALLBACK_GAIN, right: LOBBY_FALLBACK_GAIN, muffle: false, reverb: false } : undefined;
       }
-      return inLobby ? { left: LOBBY_FALLBACK_GAIN, right: LOBBY_FALLBACK_GAIN } : undefined;
+      if (speaker.clientId === listener.clientId) return undefined;
+      const result = calculateVoiceAudio({
+        state: listenerState,
+        settings,
+        activeLobbySettings: this.lobbySettings,
+        me: listener,
+        other: speaker,
+        maxDistance,
+        impostorRadioClientId: this.impostorRadioClientId,
+        inGracePeriod,
+      });
+      const gain = applyListenerVolume(result.gain, settings, listener, speaker);
+      const pan = result.panPosition ? pannerGains(result.panPosition, maxDistance) : { left: 0, right: 0 };
+      return { left: pan.left * gain, right: pan.right * gain, muffle: result.muffle, reverb: result.reverb };
     };
-    const gains = new Map<string, StereoGain>();
-    for (const [peerId, identity] of this.clients) {
-      if (!this.remoteAudio.has(peerId)) continue;
-      const gain = gainFor(identity.clientId);
-      if (gain) gains.set(peerId, gain);
+
+    // Like BCL Desktop, evaluate the rules when the game state changes, not every 20 ms frame.
+    const remotes = [...this.clients].filter(([peerId]) => this.remoteAudio.has(peerId));
+    const locals = this.localBus?.speakersFor(this.localKey, true) ?? [];
+    const key = [
+      this.stateVersion,
+      this.impostorRadioClientId,
+      inGracePeriod,
+      listener?.clientId,
+      remotes.map(([peerId, identity]) => `${peerId}:${identity.clientId}`).join(','),
+      locals.map((local) => `${local.sourceId}:${local.clientId}`).join(','),
+    ].join('|');
+    if (key !== this.cachedParamsKey) {
+      const params = new Map<string, VoiceParams>();
+      for (const [peerId, identity] of remotes) {
+        const voice = paramsFor(identity.clientId);
+        if (voice) params.set(peerId, voice);
+      }
+      for (const local of locals) {
+        const voice = paramsFor(local.clientId);
+        if (voice) params.set(local.sourceId, voice);
+      }
+      this.cachedParams = params;
+      this.cachedParamsKey = key;
     }
-    for (const local of this.localBus?.speakersFor(this.localKey, true) ?? []) {
-      const gain = gainFor(local.clientId);
-      if (gain) gains.set(local.sourceId, gain);
-    }
-    this.lastGains = new Map([...gains].map(([id, gain]) => [id, Math.round(Math.max(gain.left, gain.right) * 1000) / 1000]));
+    const params = this.cachedParams;
+    this.lastGains = new Map(
+      [...params].map(([id, voice]) => [id, Math.round(Math.max(voice.left, voice.right) * 1000) / 1000]),
+    );
     try {
-      this.emit('mixedOpus', this.outputEncoder.encode(this.mixer.mix(gains)));
+      this.emit('mixedOpus', this.outputEncoder.encode(this.mixer.mix(params)));
     } catch (error) {
       this.handleError(error);
     }
   }
-
   private replaceClients(clients: Record<string, ClientIdentity>): void {
     const next = new Set(Object.keys(clients));
     for (const id of this.clients.keys()) {

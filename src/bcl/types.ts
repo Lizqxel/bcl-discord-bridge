@@ -1,3 +1,7 @@
+import { CameraLocation, MapType } from './maps/AmongusMap.js';
+
+export { CameraLocation, MapType };
+
 export enum GameState {
   LOBBY,
   TASKS,
@@ -35,6 +39,11 @@ export type AmongUsState = {
   comsSabotaged: boolean;
   lightRadius: number;
   lightRadiusChanged: boolean;
+  /** The host's own camera view (BCL Desktop's local player), not the listener's. */
+  currentCamera?: CameraLocation;
+  map?: MapType;
+  closedDoors?: number[];
+  clientId?: number;
 };
 
 export type LobbySettings = {
@@ -50,6 +59,9 @@ export type LobbySettings = {
   meetingGhostOnly: boolean;
   hearThroughCameras: boolean;
   wallsBlockAudio: boolean;
+  ghostsCanTalkIngame: boolean;
+  /** Seconds that voices keep going after a meeting ends when meetingGhostOnly is on. */
+  gracePeriod: number;
 };
 
 export const defaultLobbySettings: LobbySettings = {
@@ -65,6 +77,8 @@ export const defaultLobbySettings: LobbySettings = {
   meetingGhostOnly: false,
   hearThroughCameras: false,
   wallsBlockAudio: false,
+  ghostsCanTalkIngame: false,
+  gracePeriod: 0,
 };
 
 export type ClientIdentity = {
