@@ -18,6 +18,8 @@ export type LocalSpeaker = {
  */
 export class LocalAudioBus {
   private readonly members = new Map<string, Member>();
+  /** A bridged impostor currently transmitting on the impostor radio. */
+  private radio?: { key: string; clientId: number };
 
   register(key: string, mixer: PcmMixer): void {
     this.members.set(key, { mixer });
@@ -25,6 +27,7 @@ export class LocalAudioBus {
 
   unregister(key: string): void {
     this.members.delete(key);
+    if (this.radio?.key === key) this.radio = undefined;
     const sourceId = LocalAudioBus.sourceId(key);
     for (const member of this.members.values()) member.mixer.removeSource(sourceId);
   }
@@ -71,6 +74,19 @@ export class LocalAudioBus {
       speakers.push({ sourceId: LocalAudioBus.sourceId(key), clientId: member.clientId });
     }
     return speakers;
+  }
+
+  setRadioTransmitter(key: string, clientId: number | undefined): void {
+    if (clientId === undefined) {
+      if (this.radio?.key === key) this.radio = undefined;
+      return;
+    }
+    this.radio = { key, clientId };
+  }
+
+  /** clientId of the bridged impostor on the radio, or -1. */
+  get radioClientId(): number {
+    return this.radio?.clientId ?? -1;
   }
 
   static sourceId(key: string): string {
